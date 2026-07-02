@@ -64,6 +64,10 @@ RESULT_TIMEOUT = 180
 # Status animatsiyasini yangilash oralig'i (soniya)
 ANIMATION_INTERVAL = 2.5
 
+# "Qayta urinish" tugmasi bilan nechta marta urinishga ruxsat berish
+# (backend band bo'lganda foydalanuvchiga imkoniyat berish uchun)
+MAX_RETRY_ATTEMPTS = 3
+
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
@@ -189,14 +193,40 @@ async def wait_for_result(session: aiohttp.ClientSession, session_hash: str) -> 
             msg = data.get("msg")
 
             if msg == "process_completed":
-                output = data.get("output", {})
+                output = data.get("output") or {}
+
                 if not output.get("success", True):
                     error_msg = output.get("error") or "Server xatoligi"
+                    logger.error("Backend 'success=False' qaytardi: %s", output)
                     raise RuntimeError(f"Generatsiya xatoligi: {error_msg}")
-                try:
-                    return output["data"][0]["url"]
-                except (KeyError, IndexError, TypeError):
+
+                result_data = output.get("data")
+                if not result_data or not isinstance(result_data, list):
+                    logger.error("Kutilmagan 'data' formati: %s", output)
                     raise RuntimeError("Natija formatini o'qib bo'lmadi")
+
+                first_item = result_data[0]
+                if first_item is None:
+                    logger.error(
+                        "Backend natija o'rniga null qaytardi. To'liq output: %s",
+                        output,
+                    )
+                    raise RuntimeError(
+                        "Model natija bera olmadi. Rasmlarni almashtirib "
+                        "qayta urinib ko'ring"
+                    )
+
+                if isinstance(first_item, dict) and "url" in first_item:
+                    return first_item["url"]
+                if isinstance(first_item, str):
+                    return first_item
+
+                logger.error(
+                    "Natija elementi kutilmagan tipda (%s): %s",
+                    type(first_item).__name__,
+                    first_item,
+                )
+                raise RuntimeError("Natija formatini o'qib bo'lmadi")
 
             if msg in ("process_error", "unexpected_error"):
                 raise RuntimeError("Server xatolik qaytardi")
@@ -408,18 +438,39 @@ async def receive_person(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return ConversationHandler.END
 
+    context.user_data["person_bytes"] = person_bytes
+    context.user_data["retry_count"] = 0
+
     # Klaviaturani olib tashlash uchun alohida, vaqtinchalik xabar yuboriladi.
     # (Muhim: ReplyKeyboardRemove bilan yuborilgan xabarni Telegram keyinchalik
     # tahrirlashga ruxsat bermaydi, shuning uchun status xabari undan ajratilgan.)
     await update.message.reply_text(
         "Qabul qilindi.", reply_markup=ReplyKeyboardRemove()
     )
-    status_message = await update.message.reply_text("⏳ Boshlanmoqda...")
+
+    await run_generation(context, update.effective_chat.id)
+    return ConversationHandler.END
+
+
+async def run_generation(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
+    """context.user_data'da saqlangan cloth_bytes/person_bytes asosida
+    generatsiyani bajaradi. Bir nechta joydan (birinchi urinish va
+    "Qayta urinish" tugmasi) chaqiriladi."""
+
+    cloth_bytes = context.user_data.get("cloth_bytes")
+    person_bytes = context.user_data.get("person_bytes")
+
+    if cloth_bytes is None or person_bytes is None:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="Xatolik: rasmlar topilmadi. /start buyrug'i bilan qayta boshlang.",
+        )
+        return
+
+    status_message = await context.bot.send_message(chat_id=chat_id, text="⏳ Boshlanmoqda...")
 
     animator = StatusAnimator(
-        bot=context.bot,
-        chat_id=update.effective_chat.id,
-        message_id=status_message.message_id,
+        bot=context.bot, chat_id=chat_id, message_id=status_message.message_id
     )
     animator.start()
 
@@ -428,7 +479,7 @@ async def receive_person(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await status_message.edit_text(text)
         except Exception:
             logger.warning("Status xabarini tahrirlab bo'lmadi, yangi xabar yuborilmoqda")
-            await update.message.reply_text(text)
+            await context.bot.send_message(chat_id=chat_id, text=text)
 
     try:
         result_url = await generate_try_on(
@@ -449,24 +500,80 @@ async def receive_person(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             logger.exception("Watermark qo'shishda xatolik, original rasm yuboriladi")
             photo_to_send = result_url
 
-        await update.message.reply_photo(
+        await context.bot.send_photo(
+            chat_id=chat_id,
             photo=photo_to_send,
             caption="Natijangiz tayyor! Yana urinib ko'rish uchun /start buyrug'ini yuboring.",
         )
+        context.user_data.clear()
+
     except TimeoutError:
         await animator.stop()
         await safe_edit(
-            "⚠️ Server javob berishga ancha vaqt ketmoqda. Birozdan so'ng qayta urinib ko'ring."
+            "⚠️ Server javob berishga ancha vaqt ketmoqda "
+            "(odatda backend bir vaqtda ko'p foydalanuvchi tomonidan band bo'lganda)."
         )
+        await offer_retry(context, chat_id)
     except Exception as exc:
         await animator.stop()
         logger.exception("Try-on generatsiyasida xatolik")
-        await safe_edit(
-            f"❌ Xatolik yuz berdi: {exc}\n\nQayta urinish uchun /start buyrug'ini yuboring."
-        )
+        await safe_edit(f"❌ Xatolik yuz berdi: {exc}")
+        await offer_retry(context, chat_id)
 
-    context.user_data.clear()
-    return ConversationHandler.END
+
+async def offer_retry(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
+    """Xatodan keyin foydalanuvchiga xuddi shu rasmlar bilan qayta urinish
+    imkoniyatini beradi. Ko'pincha bu backend bandligi tufayli sodir bo'ladi,
+    shuning uchun qayta urinish tez-tez yordam beradi."""
+
+    attempts = context.user_data.get("retry_count", 0)
+
+    if attempts >= MAX_RETRY_ATTEMPTS:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "Bir necha marta urinildi, lekin natija olinmadi.\n\n"
+                "Bu odatda backend serveri bir vaqtning o'zida juda ko'p "
+                "foydalanuvchi tomonidan ishlatilganda yuz beradi.\n\n"
+                "Iltimos, 5-10 daqiqadan so'ng /start bilan qaytadan urinib "
+                "ko'ring, yoki boshqa rasmlar bilan sinab ko'ring."
+            ),
+        )
+        context.user_data.clear()
+        return
+
+    keyboard = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("🔄 Qayta urinish", callback_data="retry_tryon")]]
+    )
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            "Bu ko'pincha backend bir vaqtda ko'p foydalanuvchi tomonidan "
+            "ishlatilganda yuz beradi. Xuddi shu rasmlar bilan qayta urinib "
+            "ko'rishingiz mumkin 👇"
+        ),
+        reply_markup=keyboard,
+    )
+
+
+async def retry_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+
+    if not context.user_data.get("cloth_bytes") or not context.user_data.get("person_bytes"):
+        await query.edit_message_text(
+            "Rasmlar topilmadi. /start buyrug'i bilan qayta boshlang."
+        )
+        return
+
+    context.user_data["retry_count"] = context.user_data.get("retry_count", 0) + 1
+
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    await run_generation(context, update.effective_chat.id)
 
 
 async def wrong_content(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -510,6 +617,9 @@ def main() -> None:
     )
 
     application.add_handler(conv_handler)
+    application.add_handler(
+        CallbackQueryHandler(retry_callback, pattern="^retry_tryon$")
+    )
 
     logger.info("Bot ishga tushdi...")
     if SUBSCRIPTION_REQUIRED:

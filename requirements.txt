@@ -2,3 +2,5 @@ python-telegram-bot==21.6
 aiohttp==3.10.10
 python-dotenv==1.0.1
 Pillow==10.4.0
+# socks5://... proxylarni ishlatish uchun kerak (http(s):// proxylar uchun shart emas)
+aiohttp-socks==0.9.1

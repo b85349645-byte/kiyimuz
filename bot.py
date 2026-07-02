@@ -45,6 +45,41 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 BASE_URL = os.getenv("BASE_URL", "https://weshopai-weshopai-virtual-try-on.hf.space")
 
+# ---------------------------------------------------------------------------
+# Proxylar: har bir foydalanuvchi so'rovlari alohida IP orqali yuborilishi uchun
+# ---------------------------------------------------------------------------
+#
+# .env faylida PROXIES o'zgaruvchisiga vergul bilan ajratilgan proxy
+# manzillarini kiriting, masalan:
+#   PROXIES=http://user1:pass1@1.2.3.4:8000,http://user2:pass2@5.6.7.8:8000,socks5://user3:pass3@9.9.9.9:1080
+#
+# Har bir Telegram foydalanuvchisi (user_id) ro'yxatdagi proxylardan biriga
+# doimiy ("sticky") tarzda biriktiriladi — ya'ni bitta foydalanuvchi doim bitta
+# proxy orqali so'rov yuboradi, turli foydalanuvchilar esa (agar proxylar soni
+# yetarli bo'lsa) turli IP'lardan foydalanadi.
+#
+# Diqqat: bu yerda haqiqiy proxy serverlar kerak (masalan pullik
+# residential/datacenter proxy provayderidan). Proxysiz (PROXIES bo'sh
+# bo'lsa) bot avvalgidek — barcha foydalanuvchilar uchun bitta umumiy
+# IP (serverning o'zi) orqali ishlaydi.
+PROXIES = [p.strip() for p in os.getenv("PROXIES", "").replace("\n", ",").split(",") if p.strip()]
+
+
+def get_proxy_for_user(user_id: int) -> str | None:
+    """Foydalanuvchi ID'siga qarab ro'yxatdan doimiy proxy tanlaydi."""
+    if not PROXIES:
+        return None
+    return PROXIES[user_id % len(PROXIES)]
+
+
+def _mask_proxy(proxy: str) -> str:
+    """Login/parolni log'larda ko'rsatmaslik uchun proxy manzilini yashiradi."""
+    if "@" in proxy:
+        scheme_and_creds, host_part = proxy.rsplit("@", 1)
+        scheme = scheme_and_creds.split("://", 1)[0]
+        return f"{scheme}://***@{host_part}"
+    return proxy
+
 # Kanalga obuna tekshiruvi (ixtiyoriy). @ belgisisiz kiriting, masalan: mychannel
 CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "").lstrip("@").strip()
 SUBSCRIPTION_REQUIRED = bool(CHANNEL_USERNAME)
@@ -132,12 +167,17 @@ async def send_subscription_gate(update: Update) -> None:
 # ---------------------------------------------------------------------------
 
 async def upload_bytes(
-    session: aiohttp.ClientSession, image_bytes: bytes, filename: str
+    session: aiohttp.ClientSession,
+    image_bytes: bytes,
+    filename: str,
+    proxy: str | None = None,
 ) -> dict:
     form = aiohttp.FormData()
     form.add_field("files", image_bytes, filename=filename, content_type="image/jpeg")
 
-    async with session.post(f"{BASE_URL}/gradio_api/upload", data=form) as resp:
+    async with session.post(
+        f"{BASE_URL}/gradio_api/upload", data=form, proxy=proxy
+    ) as resp:
         if resp.status != 200:
             raise RuntimeError(f"Yuklashda xatolik: {resp.status}")
         decoded = await resp.json()
@@ -156,6 +196,7 @@ async def join_queue(
     cloth_data: dict,
     person_data: dict,
     session_hash: str,
+    proxy: str | None = None,
 ) -> None:
     payload = {
         "data": [cloth_data, person_data, None],
@@ -168,16 +209,21 @@ async def join_queue(
         f"{BASE_URL}/gradio_api/queue/join",
         json=payload,
         headers={"Content-Type": "application/json"},
+        proxy=proxy,
     ) as resp:
         if resp.status != 200:
             raise RuntimeError(f"Navbatga qo'shilishda xatolik: {resp.status}")
 
 
-async def wait_for_result(session: aiohttp.ClientSession, session_hash: str) -> str:
+async def wait_for_result(
+    session: aiohttp.ClientSession, session_hash: str, proxy: str | None = None
+) -> str:
     url = f"{BASE_URL}/gradio_api/queue/data?session_hash={session_hash}"
     start_time = time.monotonic()
 
-    async with session.get(url, headers={"Accept": "text/event-stream"}) as resp:
+    async with session.get(
+        url, headers={"Accept": "text/event-stream"}, proxy=proxy
+    ) as resp:
         async for raw_line in resp.content:
             if time.monotonic() - start_time > RESULT_TIMEOUT:
                 raise TimeoutError("Natija kutish vaqti tugadi")
@@ -235,9 +281,21 @@ async def wait_for_result(session: aiohttp.ClientSession, session_hash: str) -> 
     raise RuntimeError("Natija olinmadi (ulanish yopildi)")
 
 
+def _build_connector(proxy: str | None):
+    """SOCKS proxylar uchun maxsus connector qaytaradi (aiohttp o'zi
+    SOCKS'ni tushunmaydi, HTTP(S) proxylarni esa `proxy=` argumenti
+    orqali to'g'ridan-to'g'ri qo'llab-quvvatlaydi)."""
+    if proxy and proxy.startswith(("socks4://", "socks5://")):
+        from aiohttp_socks import ProxyConnector
+
+        return ProxyConnector.from_url(proxy)
+    return None
+
+
 async def generate_try_on(
     cloth_bytes: bytes,
     person_bytes: bytes,
+    proxy: str | None = None,
     status_callback=None,
 ) -> str:
     # uuid4 ishlatiladi, chunki millisekund vaqt tamg'asi (time.time())
@@ -246,30 +304,40 @@ async def generate_try_on(
     # foydalanuvchilarning so'rovlari aralashib ketishiga olib kelardi.
     session_hash = uuid.uuid4().hex
 
+    is_socks = bool(proxy) and proxy.startswith(("socks4://", "socks5://"))
+    # SOCKS proxy connector orqali o'rnatiladi, HTTP(S) proxy esa har bir
+    # so'rovda `proxy=` argumenti orqali beriladi.
+    http_proxy = proxy if (proxy and not is_socks) else None
+
     timeout = aiohttp.ClientTimeout(total=RESULT_TIMEOUT + 30)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
+    connector = _build_connector(proxy)
+    async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
         if status_callback:
             status_callback("Rasmlar yuklanmoqda")
 
-        cloth_data = await upload_bytes(session, cloth_bytes, "cloth.jpg")
-        person_data = await upload_bytes(session, person_bytes, "person.jpg")
+        cloth_data = await upload_bytes(session, cloth_bytes, "cloth.jpg", proxy=http_proxy)
+        person_data = await upload_bytes(session, person_bytes, "person.jpg", proxy=http_proxy)
 
         if status_callback:
             status_callback("Navbatda kutilmoqda")
 
-        await join_queue(session, cloth_data, person_data, session_hash)
+        await join_queue(session, cloth_data, person_data, session_hash, proxy=http_proxy)
 
         if status_callback:
             status_callback("Natija tayyorlanmoqda")
 
-        result_url = await wait_for_result(session, session_hash)
+        result_url = await wait_for_result(session, session_hash, proxy=http_proxy)
 
     return result_url
 
 
-async def download_bytes(url: str) -> bytes:
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url) as resp:
+async def download_bytes(url: str, proxy: str | None = None) -> bytes:
+    is_socks = bool(proxy) and proxy.startswith(("socks4://", "socks5://"))
+    http_proxy = proxy if (proxy and not is_socks) else None
+    connector = _build_connector(proxy)
+
+    async with aiohttp.ClientSession(connector=connector) as session:
+        async with session.get(url, proxy=http_proxy) as resp:
             if resp.status != 200:
                 raise RuntimeError(f"Natija rasmini yuklab bo'lmadi: {resp.status}")
             return await resp.read()
@@ -453,11 +521,13 @@ async def receive_person(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         "Qabul qilindi.", reply_markup=ReplyKeyboardRemove()
     )
 
-    await run_generation(context, update.effective_chat.id)
+    await run_generation(context, update.effective_chat.id, update.effective_user.id)
     return ConversationHandler.END
 
 
-async def run_generation(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
+async def run_generation(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int
+) -> None:
     """context.user_data'da saqlangan cloth_bytes/person_bytes asosida
     generatsiyani bajaradi. Bir nechta joydan (birinchi urinish va
     "Qayta urinish" tugmasi) chaqiriladi."""
@@ -471,6 +541,14 @@ async def run_generation(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> No
             text="Xatolik: rasmlar topilmadi. /start buyrug'i bilan qayta boshlang.",
         )
         return
+
+    proxy = get_proxy_for_user(user_id)
+    if proxy:
+        logger.info(
+            "Foydalanuvchi %s uchun proxy ishlatilmoqda: %s",
+            user_id,
+            _mask_proxy(proxy),
+        )
 
     status_message = await context.bot.send_message(chat_id=chat_id, text="⏳ Boshlanmoqda...")
 
@@ -490,6 +568,7 @@ async def run_generation(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> No
         result_url = await generate_try_on(
             cloth_bytes=cloth_bytes,
             person_bytes=person_bytes,
+            proxy=proxy,
             status_callback=animator.set_text,
         )
 
@@ -497,7 +576,7 @@ async def run_generation(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> No
         await safe_edit("✅ Tayyor! Natija yuborilmoqda...")
 
         try:
-            raw_bytes = await download_bytes(result_url)
+            raw_bytes = await download_bytes(result_url, proxy=proxy)
             final_bytes = add_watermark(raw_bytes, WATERMARK_TEXT)
             photo_to_send = io.BytesIO(final_bytes)
             photo_to_send.name = "result.jpg"
@@ -578,7 +657,7 @@ async def retry_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     except Exception:
         pass
 
-    await run_generation(context, update.effective_chat.id)
+    await run_generation(context, update.effective_chat.id, update.effective_user.id)
 
 
 async def wrong_content(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:

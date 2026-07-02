@@ -30,6 +30,7 @@ from telegram import (
     Update,
 )
 from telegram.constants import ChatAction
+from telegram.error import NetworkError, TimedOut
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -39,6 +40,7 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+from telegram.request import HTTPXRequest
 
 load_dotenv()
 
@@ -674,6 +676,32 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return ConversationHandler.END
 
 
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Application darajasidagi umumiy xatolik ushlagichi.
+
+    Buni ro'yxatdan o'tkazmasak, kutilmagan tarmoq xatoliklari (masalan,
+    Telegram serveriga so'rov vaqti tugashi) katta traceback bilan log'ga
+    tushib, foydalanuvchiga hech qanday javob bermay qolardi. Bu yerda
+    ularni yumshoq tarzda ushlaymiz va, imkon bo'lsa, foydalanuvchiga
+    xabar beramiz."""
+
+    error = context.error
+
+    if isinstance(error, (NetworkError, TimedOut)):
+        logger.warning("Vaqtinchalik tarmoq xatoligi: %s", error)
+    else:
+        logger.error("Kutilmagan xatolik: %s", error, exc_info=error)
+
+    if isinstance(update, Update) and update.effective_chat:
+        try:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="⚠️ Vaqtinchalik xatolik yuz berdi. Iltimos, qayta urinib ko'ring.",
+            )
+        except Exception:
+            pass
+
+
 def main() -> None:
     if not BOT_TOKEN:
         raise RuntimeError(
@@ -686,12 +714,28 @@ def main() -> None:
     # boshqa barcha foydalanuvchilarning xabarlari navbatda kutib turadi va
     # bot ularga "javob bermayotgandek" ko'rinadi. Shuning uchun bir nechta
     # foydalanuvchini parallel qayta ishlashga ruxsat beramiz.
+    # Standart HTTPXRequest bitta ulanish poolidan foydalanadi. Bizda esa
+    # concurrent_updates(64) bilan bir vaqtda ko'p foydalanuvchi ishlaydi,
+    # ustiga StatusAnimator har 2.5 soniyada Telegram'ga so'rov yuboradi —
+    # shu sabab pool tezda to'lib, so'rovlar navbatda kutib, oxir-oqibat
+    # vaqti tugab (ReadTimeout) qolishi mumkin edi. Pool hajmi va
+    # timeout'larni kattalashtiramiz.
+    request = HTTPXRequest(
+        connection_pool_size=128,
+        connect_timeout=20.0,
+        read_timeout=20.0,
+        write_timeout=20.0,
+        pool_timeout=20.0,
+    )
+
     application = (
         Application.builder()
         .token(BOT_TOKEN)
+        .request(request)
         .concurrent_updates(64)
         .build()
     )
+    application.add_error_handler(error_handler)
 
     conv_handler = ConversationHandler(
         entry_points=[

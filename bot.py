@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import time
+import uuid
 
 import aiohttp
 from dotenv import load_dotenv
@@ -239,7 +240,11 @@ async def generate_try_on(
     person_bytes: bytes,
     status_callback=None,
 ) -> str:
-    session_hash = str(int(time.time() * 1000))
+    # uuid4 ishlatiladi, chunki millisekund vaqt tamg'asi (time.time())
+    # bir nechta foydalanuvchi bir vaqtda so'rov yuborganda bir xil
+    # qiymat berib qo'yishi mumkin edi — bu esa Gradio navbatida turli
+    # foydalanuvchilarning so'rovlari aralashib ketishiga olib kelardi.
+    session_hash = uuid.uuid4().hex
 
     timeout = aiohttp.ClientTimeout(total=RESULT_TIMEOUT + 30)
     async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -596,7 +601,18 @@ def main() -> None:
             "BOT_TOKEN topilmadi. .env faylida BOT_TOKEN=... qiymatini kiriting."
         )
 
-    application = Application.builder().token(BOT_TOKEN).build()
+    # concurrent_updates=True: standart holatda python-telegram-bot har bir
+    # xabarni ketma-ket (bittadan) qayta ishlaydi. Bizning holatda esa bitta
+    # generatsiya 180 soniyagacha davom etishi mumkin — shu vaqt ichida
+    # boshqa barcha foydalanuvchilarning xabarlari navbatda kutib turadi va
+    # bot ularga "javob bermayotgandek" ko'rinadi. Shuning uchun bir nechta
+    # foydalanuvchini parallel qayta ishlashga ruxsat beramiz.
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .concurrent_updates(64)
+        .build()
+    )
 
     conv_handler = ConversationHandler(
         entry_points=[
